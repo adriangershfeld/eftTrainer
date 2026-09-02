@@ -14,5 +14,6 @@ windows = { version = "0.58", features = [
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 retour = "0.3"

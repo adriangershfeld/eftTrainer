@@ -12,12 +12,13 @@
 //! That way we're calling into the *same* runtime instance the game uses,
 //! not a second disconnected copy.
 //!
-//! NOTE: written without a compiler in the loop (no local build was run
-//! while writing this) — build it and report back whatever errors show up.
+//! Scope: this file is the FFI and nothing else. Resolution policy lives in
+//! symbols.rs, the backend-neutral interface in runtime.rs, and the adapter
+//! between them in mono_runtime.rs, which is the only module that should ever
+//! import this one.
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use windows::core::PCSTR;
 use windows::Win32::Foundation::HMODULE;
@@ -102,6 +103,8 @@ type FnRuntimeInvoke = unsafe extern "C" fn(
 type FnMethodGetGenericContainer = unsafe extern "C" fn(method: *mut MonoMethod) -> *mut c_void;
 type FnMethodSignature = unsafe extern "C" fn(method: *mut MonoMethod) -> *mut MonoMethodSignature;
 type FnSignatureGetParamCount = unsafe extern "C" fn(sig: *mut MonoMethodSignature) -> u32;
+type FnObjectNew =
+    unsafe extern "C" fn(domain: *mut MonoDomain, klass: *mut MonoClass) -> *mut MonoObject;
 type FnStringNew =
     unsafe extern "C" fn(domain: *mut MonoDomain, text: *const c_char) -> *mut MonoObject;
 type FnStringToUtf8 = unsafe extern "C" fn(string_obj: *mut MonoObject) -> *mut c_char;
@@ -132,6 +135,7 @@ pub struct MonoApi {
     class_get_fields: FnClassGetFields,
     class_get_methods: FnClassGetMethods,
     object_get_class: FnObjectGetClass,
+    object_new: FnObjectNew,
     class_get_type: FnClassGetType,
     type_get_object: FnTypeGetObject,
     runtime_invoke: FnRuntimeInvoke,
@@ -191,6 +195,7 @@ impl MonoApi {
             class_get_fields: sym!("mono_class_get_fields"),
             class_get_methods: sym!("mono_class_get_methods"),
             object_get_class: sym!("mono_object_get_class"),
+            object_new: sym!("mono_object_new"),
             class_get_type: sym!("mono_class_get_type"),
             type_get_object: sym!("mono_type_get_object"),
             runtime_invoke: sym!("mono_runtime_invoke"),
@@ -412,6 +417,13 @@ impl MonoApi {
         (!obj.is_null()).then_some(obj)
     }
 
+    /// Allocates a new managed object of type `klass` WITHOUT calling any
+    /// constructor. You must invoke `.ctor` yourself immediately after.
+    pub unsafe fn object_new(&self, domain: *mut MonoDomain, klass: *mut MonoClass) -> Option<*mut MonoObject> {
+        let obj = unsafe { (self.object_new)(domain, klass) };
+        (!obj.is_null()).then_some(obj)
+    }
+
     /// Calls a static method. `args` holds one raw pointer per parameter —
     /// a reference-type argument (like a Type object) goes in as-is; a
     /// value-type argument would need boxing first, which nothing here
@@ -433,6 +445,30 @@ impl MonoApi {
         }
         (!result.is_null()).then_some(result)
     }
+
+    /// Calls an instance method. Returns Ok(ptr) — ptr may be null for void
+    /// returns. Returns Err(()) on a managed exception.
+    pub unsafe fn invoke(
+        &self,
+        method: *mut MonoMethod,
+        obj: *mut MonoObject,
+        args: &mut [*mut c_void],
+    ) -> Result<*mut MonoObject, ()> {
+        let mut exc: *mut MonoObject = std::ptr::null_mut();
+        let params_ptr = if args.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            args.as_mut_ptr()
+        };
+        let result = unsafe {
+            (self.runtime_invoke)(method, obj as *mut c_void, params_ptr, &mut exc)
+        };
+        if !exc.is_null() {
+            println!("[mono] invoke: managed exception");
+            return Err(());
+        }
+        Ok(result)
+    }
 }
 
 unsafe fn cstr_to_string(ptr: *const c_char) -> String {
@@ -442,253 +478,11 @@ unsafe fn cstr_to_string(ptr: *const c_char) -> String {
     unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
 }
 
-/// Reads a `T` out of a managed object at `object_ptr + offset`. Offsets
-/// from `mono_field_get_offset` already account for the Mono object header,
-/// so this is the correct, direct way to read an instance field once you
-/// have the field's offset and the object's address — no further math.
-/// `read_unaligned` because a field address computed this way isn't
-/// guaranteed to satisfy Rust's normal alignment assumptions.
-pub unsafe fn read_field<T: Copy>(object_ptr: *mut c_void, offset: i32) -> T {
-    let ptr = unsafe { (object_ptr as *mut u8).offset(offset as isize) } as *mut T;
-    unsafe { ptr.read_unaligned() }
-}
-
-// ---------------------------------------------------------------------
-// The name-keyed resolution table. Everything downstream (reads, writes,
-// hooks) looks a value up here by string key; nothing outside this file
-// ever holds a literal offset or address.
-// ---------------------------------------------------------------------
-
-#[derive(Clone, Copy, Debug)]
-pub enum ResolvedMember {
-    FieldOffset(i32),
-    MethodPtr(*mut c_void),
-}
-
-#[derive(Default)]
-pub struct ResolverTable {
-    entries: HashMap<&'static str, ResolvedMember>,
-}
-
-impl ResolverTable {
-    pub fn field_offset(&self, key: &str) -> Option<i32> {
-        match self.entries.get(key) {
-            Some(ResolvedMember::FieldOffset(o)) => Some(*o),
-            _ => None,
-        }
-    }
-
-    pub fn method_ptr(&self, key: &str) -> Option<*mut c_void> {
-        match self.entries.get(key) {
-            Some(ResolvedMember::MethodPtr(p)) => Some(*p),
-            _ => None,
-        }
-    }
-}
-
-/// One field this trainer wants, described by where it lives in the
-/// managed assembly and the key it's looked up under everywhere else.
-pub struct FieldSpec {
-    pub key: &'static str,
-    pub namespace: &'static str,
-    pub class: &'static str,
-    pub field: &'static str,
-}
-
-/// Same idea for a method we plan to hook or force-JIT.
-pub struct MethodSpec {
-    pub key: &'static str,
-    pub namespace: &'static str,
-    pub class: &'static str,
-    pub method: &'static str,
-    pub param_count: i32,
-}
-
-/// Pulled from dnSpy against Assembly-CSharp.dll (0.16.9.5.40743, EFU):
-/// EFT.Player.Physical -> PhysicalBase.Stamina -> Stamina.Current, plus
-/// EFT.GameWorld.MainPlayer to get from a GameWorld instance to the local
-/// Player. PhysicalBase and Stamina both live in the *global* namespace
-/// (no `namespace` block in their source), hence the empty-string
-/// namespaces below.
-pub const STAMINA_CHAIN_FIELDS: &[FieldSpec] = &[
-    FieldSpec { key: "GameWorld.MainPlayer", namespace: "EFT", class: "GameWorld", field: "MainPlayer" },
-    FieldSpec { key: "Player.Physical", namespace: "EFT", class: "Player", field: "Physical" },
-    FieldSpec { key: "PhysicalBase.Stamina", namespace: "", class: "PhysicalBase", field: "Stamina" },
-    FieldSpec { key: "Stamina.Current", namespace: "", class: "Stamina", field: "Current" },
-];
-
-/// Resolves every spec against `image`, logging each hit/miss to the
-/// console. A miss doesn't abort the run — that key just stays absent from
-/// the table and whatever feature needs it stays disabled, which is the
-/// whole point of resolving by name instead of hardcoding offsets: a
-/// renamed/removed member degrades one feature, not the DLL.
-pub unsafe fn resolve(
-    api: &MonoApi,
-    domain: *mut MonoDomain,
-    image: *mut MonoImage,
-    fields: &[FieldSpec],
-    methods: &[MethodSpec],
-) -> ResolverTable {
-    let _ = domain; // reserved for static-field specs once those're added
-    let mut table = ResolverTable::default();
-
-    for spec in fields {
-        let Some(klass) = (unsafe { api.class(image, spec.namespace, spec.class) }) else {
-            println!(
-                "[mono] miss: class {}.{} not found (for field {})",
-                spec.namespace, spec.class, spec.key
-            );
-            continue;
-        };
-        let Some(field) = (unsafe { api.field(klass, spec.field) }) else {
-            println!(
-                "[mono] miss: field {}.{}.{} not found",
-                spec.namespace, spec.class, spec.field
-            );
-            continue;
-        };
-        let offset = unsafe { api.field_offset(field) };
-        println!("[mono] resolved field {} -> offset {:#x}", spec.key, offset);
-        table.entries.insert(spec.key, ResolvedMember::FieldOffset(offset));
-    }
-
-    for spec in methods {
-        let Some(klass) = (unsafe { api.class(image, spec.namespace, spec.class) }) else {
-            println!(
-                "[mono] miss: class {}.{} not found (for method {})",
-                spec.namespace, spec.class, spec.key
-            );
-            continue;
-        };
-        let Some(method) = (unsafe { api.method(klass, spec.method, spec.param_count) }) else {
-            println!(
-                "[mono] miss: method {}.{}.{} not found",
-                spec.namespace, spec.class, spec.method
-            );
-            continue;
-        };
-        let Some(ptr) = (unsafe { api.compile(method) }) else {
-            println!("[mono] miss: mono_compile_method returned null for {}", spec.key);
-            continue;
-        };
-        println!("[mono] resolved method {} -> {:p}", spec.key, ptr);
-        table.entries.insert(spec.key, ResolvedMember::MethodPtr(ptr));
-    }
-
-    table
-}
-
-/// Resolves `UnityEngine.Object.FindObjectOfType(Type)` specifically,
-/// disambiguated from the generic `FindObjectOfType<T>(bool)` overload
-/// (see `find_method_exact`). Done once at setup, not per-poll -- the
-/// resolved method pointer doesn't change for the life of the process.
-pub unsafe fn resolve_find_object_of_type(
-    api: &MonoApi,
-    unity_object_image: *mut MonoImage,
-) -> Option<*mut MonoMethod> {
-    let object_klass = unsafe { api.class(unity_object_image, "UnityEngine", "Object") }?;
-    println!("[mono] found UnityEngine.Object class: {:p}", object_klass);
-    let method = unsafe { api.find_method_exact(object_klass, "FindObjectOfType", 1) }?;
-    println!("[mono] resolved non-generic FindObjectOfType(Type): {:p}", method);
-    Some(method)
-}
-
-/// `typeof(class)` as a real managed Type object -- also resolved once at
-/// setup and reused on every poll, since it's the same argument every
-/// call.
-pub unsafe fn resolve_type_object(
-    api: &MonoApi,
-    domain: *mut MonoDomain,
-    image: *mut MonoImage,
-    namespace: &str,
-    class: &str,
-) -> Option<*mut MonoObject> {
-    let klass = unsafe { api.class(image, namespace, class) }?;
-    let ty = unsafe { api.class_type(klass) };
-    let obj = unsafe { api.type_object(domain, ty) };
-    if obj.is_some() {
-        println!("[mono] resolved Type object for {}.{}", namespace, class);
-    }
-    obj
-}
-
-/// Calls the already-resolved FindObjectOfType(Type) with an
-/// already-resolved Type object. Returns None both on a real failure and
-/// on the expected "not in a raid/hideout right now" case -- GameWorld
-/// only exists once a raid or the hideout is loaded, so a null result at
-/// the main menu is normal, not a bug.
-pub unsafe fn find_object_of_type(
-    api: &MonoApi,
-    find_method: *mut MonoMethod,
-    type_obj: *mut MonoObject,
-) -> Option<*mut MonoObject> {
-    let mut args = [type_obj as *mut c_void];
-    unsafe { api.invoke_static(find_method, &mut args) }
-}
-
-/// Live readout: finds the current GameWorld (None outside a raid/hideout)
-/// and walks MainPlayer -> Physical -> Stamina -> Current using offsets
-/// already resolved into `table`. Cheap enough to call on a timer -- no
-/// class/method resolution happens here, just one invoke against the
-/// already-resolved `find_method`/`game_world_type_obj` and three
-/// pointer-chases. Also works in the hideout: GameWorld is `abstract`, so
-/// FindObjectOfType matches whatever concrete subclass is live (raids use
-/// ClientLocalGameWorld; the hideout is the same player/movement/stamina
-/// systems running under its own world instance), and stamina drains there
-/// the same way it does in a raid even though the HUD doesn't show it.
-pub unsafe fn read_current_stamina(
-    api: &MonoApi,
-    find_method: *mut MonoMethod,
-    game_world_type_obj: *mut MonoObject,
-    table: &ResolverTable,
-) -> Option<f32> {
-    let game_world = unsafe { find_object_of_type(api, find_method, game_world_type_obj) }?;
-
-    let main_player_off = table.field_offset("GameWorld.MainPlayer")?;
-    let physical_off = table.field_offset("Player.Physical")?;
-    let stamina_off = table.field_offset("PhysicalBase.Stamina")?;
-    let current_off = table.field_offset("Stamina.Current")?;
-
-    let player_ptr: *mut c_void = unsafe { read_field(game_world as *mut c_void, main_player_off) };
-    if player_ptr.is_null() {
-        return None;
-    }
-    let physical_ptr: *mut c_void = unsafe { read_field(player_ptr, physical_off) };
-    if physical_ptr.is_null() {
-        return None;
-    }
-    let stamina_ptr: *mut c_void = unsafe { read_field(physical_ptr, stamina_off) };
-    if stamina_ptr.is_null() {
-        return None;
-    }
-    Some(unsafe { read_field(stamina_ptr, current_off) })
-}
-
-/// Sanity check for the next injection test: loads the API, gets the root
-/// domain, attaches this thread, and opens Assembly-CSharp.dll. No
-/// class/field names are guessed here — this only proves the pipeline
-/// itself works against the live game. Returns (api, domain, image) on
-/// success so real FieldSpec/MethodSpec resolution can follow once you've
-/// pulled real names out of dnSpy.
-pub unsafe fn smoke_test(assembly_csharp_path: &str) -> Option<(MonoApi, *mut MonoDomain, *mut MonoImage)> {
-    let api = unsafe { MonoApi::load_with_retry(std::time::Duration::from_secs(15)) }?;
-    println!("[mono] API loaded (26 symbols)");
-
-    let domain = unsafe { api.root_domain() };
-    if domain.is_null() {
-        println!("[mono] root domain is null");
-        return None;
-    }
-    println!("[mono] root domain: {:p}", domain);
-
-    unsafe { api.attach_thread(domain) };
-    println!("[mono] thread attached");
-
-    let assembly = unsafe { api.open_assembly(domain, assembly_csharp_path) }?;
-    println!("[mono] opened assembly: {}", assembly_csharp_path);
-
-    let image = unsafe { api.image(assembly) };
-    println!("[mono] got image: {:p}", image);
-
-    Some((api, domain, image))
-}
+// Everything past this point -- the name-keyed ResolverTable, FieldSpec/
+// MethodSpec, STAMINA_CHAIN_FIELDS, resolve(), the FindObjectOfType helpers,
+// read_current_stamina() and smoke_test() -- was superseded by symbols.rs and
+// runtime.rs and has been removed. Two parallel resolvers is how a future
+// session ends up editing the one that isn't wired up. Git history has them.
+//
+// This file is now ONLY the raw Mono FFI. MonoRuntime in mono_runtime.rs is
+// the only thing that should ever touch it.

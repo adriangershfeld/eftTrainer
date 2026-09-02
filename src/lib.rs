@@ -1,3 +1,14 @@
+//! eftTrainer: internal trainer for offline SPT/EFU.
+//!
+//!   lib/menu/hooks    features and plumbing, backend-agnostic
+//!   symbols           every game- and engine-specific name
+//!   runtime           ScriptRuntime trait
+//!   mono_runtime      trait impl over Mono
+//!   mono              raw Mono FFI
+//!
+//! Porting to IL2CPP (EFT 1.0+) means adding il2cpp_runtime.rs and diffing
+//! symbols.rs. Nothing above those two should need to change.
+
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -7,14 +18,27 @@ use windows::Win32::System::LibraryLoader::{FreeLibraryAndExitThread, GetModuleF
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_END};
 
+mod console;
 mod hooks;
+mod menu;
 mod mono;
+mod mono_runtime;
+mod runtime;
+mod symbols;
 
-/// Directory containing the running exe, so we can find
-/// `EscapeFromTarkov_Data\Managed\*.dll` relative to it instead of
-/// hardcoding an install path.
+use runtime::{Domain, Method, Object, ScriptRuntime};
+use symbols::{key, unity};
+
+macro_rules! clog {
+    ($($arg:tt)*) => {{
+        let s = format!($($arg)*);
+        println!("{}", s);
+        crate::console::push(s);
+    }};
+}
+
 fn current_exe_dir() -> Option<std::path::PathBuf> {
-    let mut buf = [0u8; 260]; // MAX_PATH
+    let mut buf = [0u8; 260];
     let len = unsafe { GetModuleFileNameA(None, &mut buf) };
     if len == 0 {
         return None;
@@ -23,172 +47,194 @@ fn current_exe_dir() -> Option<std::path::PathBuf> {
     std::path::Path::new(path_str).parent().map(|p| p.to_path_buf())
 }
 
-/// Everything the periodic stamina readout needs, resolved once at inject
-/// time so the main loop's per-tick work is just one invoke plus three
-/// pointer-chases -- no class/method lookups happen after setup.
-struct MonoState {
-    api: mono::MonoApi,
-    find_object_of_type: *mut mono::MonoMethod,
-    game_world_type_obj: *mut mono::MonoObject,
-    table: mono::ResolverTable,
+/// QuickEdit means one click in the console blocks every write until it is
+/// dismissed, which hangs the main thread inside any detour that prints.
+unsafe fn disable_console_quick_edit() {
+    use windows::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE, STD_INPUT_HANDLE,
+    };
+    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    unsafe {
+        let Ok(h) = GetStdHandle(STD_INPUT_HANDLE) else { return };
+        let mut mode = CONSOLE_MODE(0);
+        if GetConsoleMode(h, &mut mode).is_ok() {
+            let new = CONSOLE_MODE((mode.0 & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS);
+            let _ = SetConsoleMode(h, new);
+        }
+    }
 }
 
-/// One-time setup: opens Assembly-CSharp.dll, resolves the stamina field
-/// chain, opens UnityEngine.CoreModule.dll, resolves the (disambiguated)
-/// FindObjectOfType(Type) method plus a cached typeof(GameWorld) object,
-/// and installs the Debug.Log hook proof-of-concept. Every step logs what
-/// it did, specifically so that if this crashes again, the last printed
-/// line says exactly which call didn't come back.
-unsafe fn setup_mono_state() -> Option<MonoState> {
+/// Resolved once at inject time. The runtime itself lives in runtime's
+/// OnceLock so the main-thread menu can reach it without a stack address.
+struct Session {
+    rt: &'static dyn ScriptRuntime,
+    domain: Domain,
+    find_object_of_type: Method,
+    game_world_type: Object,
+    offsets: symbols::Offsets,
+}
+
+unsafe fn setup() -> Option<Session> {
     let exe_dir = current_exe_dir()?;
-    let managed_dir = exe_dir.join("EscapeFromTarkov_Data").join("Managed");
-    let assembly_csharp_path = managed_dir.join("Assembly-CSharp.dll");
+    let managed_dir = exe_dir
+        .join("EscapeFromTarkov_Data")
+        .join("Managed")
+        .to_string_lossy()
+        .into_owned();
+    clog!("[eftTrainer] managed dir: {}", managed_dir);
 
-    println!("[eftTrainer] mono smoke test starting: {}", assembly_csharp_path.display());
-    let (api, domain, assembly_csharp_image) =
-        unsafe { mono::smoke_test(&assembly_csharp_path.to_string_lossy()) }?;
-    println!("[eftTrainer] mono smoke test: OK, resolution pipeline is live");
+    let boxed = unsafe { mono_runtime::detect(&managed_dir) }?;
+    if !runtime::install(boxed) {
+        clog!("[eftTrainer] runtime already installed, unexpected");
+    }
+    let rt = runtime::get()?;
+    clog!("[eftTrainer] runtime: {}", rt.backend().name());
 
-    let table = unsafe { mono::resolve(&api, domain, assembly_csharp_image, mono::STAMINA_CHAIN_FIELDS, &[]) };
-
-    println!("[eftTrainer] opening UnityEngine.CoreModule.dll...");
-    let unity_path = managed_dir.join("UnityEngine.CoreModule.dll");
-    let Some(unity_assembly) = (unsafe { api.open_assembly(domain, &unity_path.to_string_lossy()) }) else {
-        println!("[eftTrainer] could not open UnityEngine.CoreModule.dll, stamina readout disabled");
+    let domain = unsafe { rt.root_domain() };
+    if domain.is_null() {
+        clog!("[eftTrainer] root domain is null");
         return None;
-    };
-    println!("[eftTrainer] opened UnityEngine.CoreModule.dll");
-    let unity_object_image = unsafe { api.image(unity_assembly) };
+    }
+    unsafe { rt.attach_thread(domain) };
+    clog!("[eftTrainer] domain {:p}, thread attached", domain.raw());
 
-    println!("[eftTrainer] resolving FindObjectOfType(Type)...");
-    let Some(find_object_of_type) = (unsafe { mono::resolve_find_object_of_type(&api, unity_object_image) }) else {
-        println!("[eftTrainer] could not resolve FindObjectOfType(Type), stamina readout disabled");
+    let offsets = unsafe { symbols::resolve_fields(rt, domain, symbols::STAMINA_CHAIN) };
+    clog!(
+        "[eftTrainer] resolved {}/{} stamina chain fields",
+        offsets.len(),
+        symbols::STAMINA_CHAIN.len()
+    );
+
+    // Singleton<GameWorld>.Instance is a closed generic with no
+    // class_from_name route, so go via FindObjectOfType(Type) instead.
+    let obj_cls = unsafe { symbols::find_class(rt, domain, unity::OBJECT) }?;
+    let find_object_of_type =
+        unsafe { symbols::find_method(rt, obj_cls, unity::FIND_OBJECT_OF_TYPE, 1) }?;
+    let game_world_type =
+        unsafe { symbols::find_type_object(rt, domain, symbols::eft::GAME_WORLD) }?;
+    clog!("[eftTrainer] FindObjectOfType(Type) + typeof(GameWorld) resolved");
+
+    Some(Session { rt, domain, find_object_of_type, game_world_type, offsets })
+}
+
+/// None on failure and on "no world loaded" alike; null at the menu is normal.
+unsafe fn read_stamina(s: &Session) -> Option<f32> {
+    let mut args = [s.game_world_type.raw()];
+    let world = unsafe { s.rt.invoke_static(s.find_object_of_type, &mut args) }?;
+    if world.is_null() {
         return None;
-    };
-
-    println!("[eftTrainer] resolving typeof(EFT.GameWorld)...");
-    let Some(game_world_type_obj) =
-        (unsafe { mono::resolve_type_object(&api, domain, assembly_csharp_image, "EFT", "GameWorld") })
-    else {
-        println!("[eftTrainer] could not resolve typeof(EFT.GameWorld), stamina readout disabled");
-        return None;
-    };
-
-    // Hooking proof-of-concept: inert (Debug.Log still logs normally
-    // through the trampoline), but a real inline hook on a real
-    // JIT-compiled game method -- the other half of the "resolve by name,
-    // hook the pointer Mono hands back" architecture, exercised now
-    // separately from any actual gameplay feature.
-    println!("[eftTrainer] installing Debug.Log hook (proof-of-concept, inert)...");
-    if unsafe { hooks::install_debug_log_hook(&api, unity_object_image) } {
-        unsafe { hooks::trigger_test_log(&api, domain, unity_object_image) };
     }
 
-    println!("[eftTrainer] mono setup complete, stamina readout armed");
-    Some(MonoState {
-        api,
-        find_object_of_type,
-        game_world_type_obj,
-        table,
-    })
+    let player: Object = Object(unsafe { runtime::read_field(world, s.offsets.get(key::MAIN_PLAYER)?) });
+    if player.is_null() {
+        return None;
+    }
+    let physical: Object = Object(unsafe { runtime::read_field(player, s.offsets.get(key::PHYSICAL)?) });
+    if physical.is_null() {
+        return None;
+    }
+    let stamina: Object = Object(unsafe { runtime::read_field(physical, s.offsets.get(key::STAMINA)?) });
+    if stamina.is_null() {
+        return None;
+    }
+    Some(unsafe { runtime::read_field(stamina, s.offsets.get(key::STAMINA_CURRENT)?) })
 }
 
 #[unsafe(no_mangle)]
 #[allow(non_snake_case, clippy::not_unsafe_ptr_arg_deref)]
 extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *mut core::ffi::c_void) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
-        // HMODULE wraps a raw pointer, which isn't Send, so it can't cross
-        // into the closure directly. The value itself is just an opaque
-        // handle (no aliasing/lifetime concerns), so we pass it as a usize
-        // and rebuild the HMODULE inside the thread.
+        // HMODULE isn't Send, so it crosses as a usize.
         let hinst_raw = hinst.0 as usize;
-
-        // Never do real work directly in DllMain — you're holding the loader
-        // lock here, and calling into most Win32 APIs (or allocating) can
-        // deadlock the process. Spawn a thread and do everything there.
         thread::spawn(move || unsafe {
             let hinst = HMODULE(hinst_raw as *mut core::ffi::c_void);
             let _ = AllocConsole();
+            disable_console_quick_edit();
 
-            // Route panic messages through our own console rather than
-            // relying on stderr having been re-pointed at CONOUT$ by
-            // AllocConsole (inconsistent across CRTs) -- and this is a
-            // process-wide hook, so it also covers anything in the retour
-            // trampoline machinery or elsewhere in the process that panics
-            // on a thread we don't otherwise wrap.
             std::panic::set_hook(Box::new(|info| {
                 println!("[panic] {}", info);
             }));
 
-            println!("[eftTrainer] injected OK, DllMain reached DLL_PROCESS_ATTACH");
-            println!("[eftTrainer] press END to unload");
+            clog!("[eftTrainer] injected OK -- INSERT toggles menu, END or X unloads");
 
-            // Setup is wrapped separately from the main loop: a panic here
-            // just means "stamina readout unavailable this session" (same
-            // as any other setup failure already handled below), not a
-            // dead thread -- END-key unload must keep working regardless
-            // of whether Mono setup succeeded.
-            let mono_state = match catch_unwind(AssertUnwindSafe(|| setup_mono_state())) {
-                Ok(state) => state,
+            let session = match catch_unwind(AssertUnwindSafe(|| setup())) {
+                Ok(s) => s,
                 Err(_) => {
-                    println!("[eftTrainer] setup_mono_state panicked (caught) -- stamina readout unavailable");
+                    clog!("[eftTrainer] setup panicked (caught)");
                     None
                 }
             };
-            if mono_state.is_none() {
-                println!("[eftTrainer] stamina readout unavailable this session (see lines above)");
+            if session.is_none() {
+                clog!("[eftTrainer] no scripting runtime this session -- idling, END to unload");
             }
 
-            // Printed only on change, so sprinting-to-exhaustion in the
-            // hideout (no HUD stamina bar there, but it drains the same as
-            // in a raid) is visible in the console without spamming it
-            // every tick.
+            if let Some(ref s) = session {
+                menu::set_domain(s.domain);
+                clog!("[eftTrainer] installing per-frame driver hook...");
+                if hooks::install_driver_hook(s.rt, s.domain) {
+                    clog!("[eftTrainer] driver armed -- menu builds on first frame with a live GameWorld");
+                } else {
+                    clog!("[eftTrainer] driver unavailable -- menu will not appear");
+                }
+            }
+
             let mut last_printed: Option<f32> = None;
             let mut last_poll = Instant::now();
 
+            // Unload is a handshake and skipping a step crashes the game:
+            //   1. END flags it; main thread tears down the UI, returns false
+            //   2. disable the detour, wait for it to drain
+            //   3. only then free
+            let mut unload_deadline: Option<Instant> = None;
+
             loop {
-                let key_down = (GetAsyncKeyState(VK_END.0 as i32) as u16 & 0x8000) != 0;
-                if key_down {
-                    println!("[eftTrainer] unloading...");
-                    // brief pause so the print above actually flushes to the
-                    // console before we tear down our own module
-                    thread::sleep(Duration::from_millis(150));
+                let end_key = (GetAsyncKeyState(VK_END.0 as i32) as u16 & 0x8000) != 0;
+                if end_key && unload_deadline.is_none() {
+                    clog!("[eftTrainer] END pressed, asking main thread to tear down...");
+                    menu::request_unload();
+                    // No GameWorld means no driver, so no acknowledgement.
+                    unload_deadline = Some(Instant::now() + Duration::from_secs(2));
+                }
+
+                let acked = hooks::unload_requested();
+                let timed_out = unload_deadline.is_some_and(|d| Instant::now() >= d);
+
+                if acked || timed_out {
+                    if timed_out && !acked {
+                        clog!("[eftTrainer] no driver acknowledgement (no live GameWorld?)");
+                    }
+                    clog!("[eftTrainer] unloading...");
+                    if !hooks::shutdown(Duration::from_secs(2)) {
+                        clog!("[eftTrainer] hooks did not shut down cleanly.");
+                        clog!("[eftTrainer] NOT unloading -- freeing now would crash the game.");
+                        clog!("[eftTrainer] restart the game to clear it.");
+                        unload_deadline = None;
+                        thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                    thread::sleep(Duration::from_millis(100));
                     let _ = FreeConsole();
-                    // Frees this DLL and terminates this thread as one atomic
-                    // step — calling FreeLibrary + ExitThread separately here
-                    // would race, since this code itself lives in the module
-                    // being freed.
                     FreeLibraryAndExitThread(hinst, 0);
                 }
 
-                if let Some(state) = &mono_state {
+                if let Some(ref s) = session {
                     if last_poll.elapsed() >= Duration::from_millis(500) {
                         last_poll = Instant::now();
-                        // Wrapped per-tick, not just at setup: a panic
-                        // during a single poll (e.g. a future feature added
-                        // here later) shouldn't kill the loop -- END-key
-                        // unload has to keep working no matter what a poll
-                        // does.
-                        let reading = catch_unwind(AssertUnwindSafe(|| {
-                            mono::read_current_stamina(
-                                &state.api,
-                                state.find_object_of_type,
-                                state.game_world_type_obj,
-                                &state.table,
-                            )
-                        }))
-                        .unwrap_or_else(|_| {
-                            println!("[eftTrainer] stamina poll panicked (caught), skipping this tick");
-                            None
-                        });
+                        let reading = catch_unwind(AssertUnwindSafe(|| read_stamina(s)))
+                            .unwrap_or_else(|_| {
+                                clog!("[eftTrainer] stamina poll panicked (caught)");
+                                None
+                            });
+                        // Status row, not clog!, or these evict the startup log.
                         match reading {
-                            Some(current) if Some(current) != last_printed => {
-                                println!("[eftTrainer] current stamina: {}", current);
-                                last_printed = Some(current);
+                            Some(v) if Some(v) != last_printed => {
+                                menu::set_status(format!("stamina  {:.1}", v));
+                                last_printed = Some(v);
                             }
                             None if last_printed.is_some() => {
-                                // Left the raid/hideout (or GameWorld tore down).
-                                println!("[eftTrainer] no active GameWorld/player right now");
+                                menu::set_status("no active GameWorld/player".to_string());
+                                clog!("[eftTrainer] world gone (raid ended or menu)");
                                 last_printed = None;
                             }
                             _ => {}
