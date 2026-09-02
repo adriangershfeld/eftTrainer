@@ -220,7 +220,7 @@ impl MonoApi {
                 return Some(api);
             }
             if start.elapsed() >= max_wait {
-                println!("[mono] gave up waiting for mono-2.0-bdwgc.dll after {:?}", max_wait);
+                crate::elog!("[mono] gave up waiting for mono-2.0-bdwgc.dll after {:?}", max_wait);
                 return None;
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -440,7 +440,7 @@ impl MonoApi {
         };
         let result = unsafe { (self.runtime_invoke)(method, std::ptr::null_mut(), params_ptr, &mut exc) };
         if !exc.is_null() {
-            println!("[mono] invoke_static: managed exception raised, ignoring result");
+            crate::elog!("[mono] invoke_static: managed exception raised, ignoring result");
             return None;
         }
         (!result.is_null()).then_some(result)
@@ -464,7 +464,7 @@ impl MonoApi {
             (self.runtime_invoke)(method, obj as *mut c_void, params_ptr, &mut exc)
         };
         if !exc.is_null() {
-            println!("[mono] invoke: managed exception");
+            crate::elog!("[mono] invoke: managed exception");
             return Err(());
         }
         Ok(result)

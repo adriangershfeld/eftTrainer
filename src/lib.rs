@@ -13,7 +13,6 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, HMODULE, TRUE};
-use windows::Win32::System::Console::{AllocConsole, FreeConsole};
 use windows::Win32::System::LibraryLoader::{FreeLibraryAndExitThread, GetModuleFileNameA};
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_END};
@@ -31,9 +30,7 @@ use symbols::{key, unity};
 
 macro_rules! clog {
     ($($arg:tt)*) => {{
-        let s = format!($($arg)*);
-        println!("{}", s);
-        crate::console::push(s);
+        crate::console::emit(&format!($($arg)*));
     }};
 }
 
@@ -45,24 +42,6 @@ fn current_exe_dir() -> Option<std::path::PathBuf> {
     }
     let path_str = std::str::from_utf8(&buf[..len as usize]).ok()?;
     std::path::Path::new(path_str).parent().map(|p| p.to_path_buf())
-}
-
-/// QuickEdit means one click in the console blocks every write until it is
-/// dismissed, which hangs the main thread inside any detour that prints.
-unsafe fn disable_console_quick_edit() {
-    use windows::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE, STD_INPUT_HANDLE,
-    };
-    const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
-    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
-    unsafe {
-        let Ok(h) = GetStdHandle(STD_INPUT_HANDLE) else { return };
-        let mut mode = CONSOLE_MODE(0);
-        if GetConsoleMode(h, &mut mode).is_ok() {
-            let new = CONSOLE_MODE((mode.0 & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS);
-            let _ = SetConsoleMode(h, new);
-        }
-    }
 }
 
 /// Resolved once at inject time. The runtime itself lives in runtime's
@@ -149,14 +128,13 @@ extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *mut core::ff
         let hinst_raw = hinst.0 as usize;
         thread::spawn(move || unsafe {
             let hinst = HMODULE(hinst_raw as *mut core::ffi::c_void);
-            let _ = AllocConsole();
-            disable_console_quick_edit();
 
             std::panic::set_hook(Box::new(|info| {
-                println!("[panic] {}", info);
+                console::emit(&format!("[panic] {info}"));
             }));
 
             clog!("[eftTrainer] injected OK -- INSERT toggles menu, END or X unloads");
+            clog!("[eftTrainer] log file: {}", console::log_path().display());
 
             let session = match catch_unwind(AssertUnwindSafe(|| setup())) {
                 Ok(s) => s,
@@ -214,7 +192,6 @@ extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *mut core::ff
                         continue;
                     }
                     thread::sleep(Duration::from_millis(100));
-                    let _ = FreeConsole();
                     FreeLibraryAndExitThread(hinst, 0);
                 }
 

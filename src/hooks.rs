@@ -59,9 +59,9 @@ unsafe extern "C" fn driver_detour(this: *mut c_void) {
 pub unsafe fn shutdown(timeout: std::time::Duration) -> bool {
     if let Some(h) = DRIVER_HOOK.get() {
         match unsafe { h.disable() } {
-            Ok(()) => println!("[hook] driver detour disabled"),
+            Ok(()) => crate::elog!("[hook] driver detour disabled"),
             Err(e) => {
-                println!("[hook] driver disable FAILED: {e:?} -- unsafe to unload");
+                crate::elog!("[hook] driver disable FAILED: {e:?} -- unsafe to unload");
                 return false;
             }
         }
@@ -71,11 +71,11 @@ pub unsafe fn shutdown(timeout: std::time::Duration) -> bool {
     loop {
         let n = IN_DETOUR.load(Ordering::Acquire);
         if n == 0 {
-            println!("[hook] detour drained, safe to unload");
+            crate::elog!("[hook] detour drained, safe to unload");
             return true;
         }
         if start.elapsed() >= timeout {
-            println!("[hook] {} call(s) still inside the detour after {:?}", n, timeout);
+            crate::elog!("[hook] {} call(s) still inside the detour after {:?}", n, timeout);
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -89,41 +89,44 @@ pub unsafe fn install_driver_hook(rt: &dyn ScriptRuntime, domain: Domain) -> boo
     }
     let Some(gw_cls) = (unsafe { symbols::find_class(rt, domain, symbols::eft::GAME_WORLD) })
     else {
-        println!("[hook] GameWorld class not resolved -- no driver");
+        crate::elog!("[hook] GameWorld class not resolved -- no driver");
         return false;
     };
 
     for name in symbols::eft::DRIVER_METHODS {
         let Some(method) = (unsafe { rt.method_exact(gw_cls, name, 0) }) else {
-            println!("[hook] driver candidate GameWorld.{} not found", name);
+            crate::elog!("[hook] driver candidate GameWorld.{} not found", name);
             continue;
         };
         let Some(ptr) = (unsafe { rt.native_ptr(method) }) else {
-            println!("[hook] driver candidate GameWorld.{} has no native address", name);
+            crate::elog!("[hook] driver candidate GameWorld.{} has no native address", name);
             continue;
         };
-        println!("[hook] driver candidate GameWorld.{} -> {:p}", name, ptr);
+        crate::elog!("[hook] driver candidate GameWorld.{} -> {:p}", name, ptr);
 
         let target: DriverFn = unsafe { std::mem::transmute::<*mut c_void, DriverFn>(ptr) };
+        crate::elog!("[hook] building trampoline for {}...", name);
         let hook = match unsafe { GenericDetour::new(target, driver_detour) } {
             Ok(h) => h,
             Err(e) => {
-                println!("[hook] GenericDetour::new failed for {}: {e:?}", name);
+                crate::elog!("[hook] GenericDetour::new failed for {}: {e:?}", name);
                 continue;
             }
         };
+        crate::elog!("[hook] trampoline built, enabling...");
         if let Err(e) = unsafe { hook.enable() } {
-            println!("[hook] enable failed for {}: {e:?}", name);
+            crate::elog!("[hook] enable failed for {}: {e:?}", name);
             continue;
         }
+        crate::elog!("[hook] enabled, storing...");
         if DRIVER_HOOK.set(hook).is_err() {
-            println!("[hook] driver hook set concurrently, unexpected");
+            crate::elog!("[hook] driver hook set concurrently, unexpected");
             return false;
         }
-        println!("[hook] driver installed on GameWorld.{} -- arms on next world", name);
+        crate::elog!("[hook] driver installed on GameWorld.{} -- arms on next world", name);
         return true;
     }
 
-    println!("[hook] no usable driver method on GameWorld -- menu unavailable");
+    crate::elog!("[hook] no usable driver method on GameWorld -- menu unavailable");
     false
 }

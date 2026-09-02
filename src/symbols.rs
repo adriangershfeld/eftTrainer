@@ -175,14 +175,14 @@ pub unsafe fn find_class(
     c: ClassRef,
 ) -> Option<Class> {
     let Some(image) = (unsafe { rt.image(domain, c.assembly) }) else {
-        println!("[sym] MISSING assembly: {}", c.assembly);
+        crate::elog!("[sym] MISSING assembly: {}", c.assembly);
         return None;
     };
     match unsafe { rt.class(image, c.namespace, c.name) } {
         Some(k) => Some(k),
         None => {
             let ns = if c.namespace.is_empty() { "<global>" } else { c.namespace };
-            println!("[sym] MISSING class: {}::{}.{}", c.assembly, ns, c.name);
+            crate::elog!("[sym] MISSING class: {}::{}.{}", c.assembly, ns, c.name);
             None
         }
     }
@@ -198,7 +198,7 @@ pub unsafe fn find_type_object(
     match unsafe { rt.type_object(domain, class) } {
         Some(o) => Some(o),
         None => {
-            println!("[sym] MISSING Type object for {}", c.name);
+            crate::elog!("[sym] MISSING Type object for {}", c.name);
             None
         }
     }
@@ -214,7 +214,7 @@ pub unsafe fn find_method(
     match unsafe { rt.method_exact(class, name, argc) } {
         Some(m) => Some(m),
         None => {
-            println!("[sym] MISSING method: {}/{}", name, argc);
+            crate::elog!("[sym] MISSING method: {}/{}", name, argc);
             None
         }
     }
@@ -245,11 +245,11 @@ pub unsafe fn resolve_fields(
     for spec in specs {
         let Some(class) = (unsafe { find_class(rt, domain, spec.class) }) else { continue };
         let Some(field) = (unsafe { rt.field(class, spec.field) }) else {
-            println!("[sym] MISSING field: {}.{}", spec.class.name, spec.field);
+            crate::elog!("[sym] MISSING field: {}.{}", spec.class.name, spec.field);
             continue;
         };
         let offset = unsafe { rt.field_offset(field) };
-        println!("[sym] {} -> offset {:#x}", spec.key, offset);
+        crate::elog!("[sym] {} -> offset {:#x}", spec.key, offset);
         out.entries.insert(spec.key, offset);
     }
     out

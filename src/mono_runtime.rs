@@ -148,11 +148,11 @@ impl ScriptRuntime for MonoRuntime {
 pub unsafe fn detect(managed_dir: &str) -> Option<Box<dyn ScriptRuntime>> {
     if let Some(rt) = unsafe { MonoRuntime::load(managed_dir, std::time::Duration::from_secs(15)) }
     {
-        println!("[runtime] backend: Mono");
+        crate::elog!("[runtime] backend: Mono");
         return Some(Box::new(rt));
     }
-    println!("[runtime] no Mono runtime in this process.");
-    println!("[runtime] if GameAssembly.dll is present this is an IL2CPP build (EFT 1.0+),");
-    println!("[runtime] which needs Il2CppRuntime -- not implemented yet.");
+    crate::elog!("[runtime] no Mono runtime in this process.");
+    crate::elog!("[runtime] if GameAssembly.dll is present this is an IL2CPP build (EFT 1.0+),");
+    crate::elog!("[runtime] which needs Il2CppRuntime -- not implemented yet.");
     None
 }

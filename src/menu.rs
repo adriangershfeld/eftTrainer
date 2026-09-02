@@ -55,12 +55,12 @@ pub fn request_unload() {
 unsafe fn teardown(rt: &dyn ScriptRuntime) {
     let Some(ms) = (unsafe { (*(&raw const MENU_STATE)).as_ref() }) else { return };
     if ms.m.obj_destroy.is_null() || ms.h.root_go.is_null() {
-        println!("[menu] no Destroy available -- overlay will linger until the scene changes");
+        crate::elog!("[menu] no Destroy available -- overlay will linger until the scene changes");
         return;
     }
     let mut args = [ms.h.root_go.raw()];
     unsafe { invoke_static(rt, ms.m.obj_destroy, &mut args) };
-    println!("[menu] overlay destroyed");
+    crate::elog!("[menu] overlay destroyed");
 }
 
 // ── per-frame throttle ────────────────────────────────────────────────────────
@@ -328,10 +328,10 @@ unsafe fn resolve_font(rt: &dyn ScriptRuntime, domain: Domain) -> Option<Object>
         let mut args = [font_type.raw(), name_str.raw()];
         match unsafe { rt.invoke_static(get_builtin, &mut args) } {
             Some(f) if !f.is_null() => {
-                println!("[menu] font: {}", name);
+                crate::elog!("[menu] font: {}", name);
                 return Some(f);
             }
-            _ => println!("[menu] builtin font {} not available", name),
+            _ => crate::elog!("[menu] builtin font {} not available", name),
         }
     }
     None
@@ -356,7 +356,7 @@ unsafe fn resolve_methods(rt: &dyn ScriptRuntime, domain: Domain) -> Option<M> {
     let cv_cls = need_class!(unity::CANVAS);
     let gr_cls = need_class!(unity::GRAPHIC);
     let tx_cls = need_class!(unity::TEXT);
-    println!("[menu] classes resolved");
+    crate::elog!("[menu] classes resolved");
 
     let ty_canvas = unsafe { symbols::find_type_object(rt, domain, unity::CANVAS) }
         .unwrap_or(Object::NULL);
@@ -369,7 +369,7 @@ unsafe fn resolve_methods(rt: &dyn ScriptRuntime, domain: Domain) -> Option<M> {
 
     let font = unsafe { resolve_font(rt, domain) }.unwrap_or(Object::NULL);
     if font.is_null() {
-        println!("[menu] NO FONT -- all labels will be invisible");
+        crate::elog!("[menu] NO FONT -- all labels will be invisible");
     }
 
     let mut missing: u32 = 0;
@@ -378,7 +378,7 @@ unsafe fn resolve_methods(rt: &dyn ScriptRuntime, domain: Domain) -> Option<M> {
             match unsafe { rt.method_exact($cls, $name, $n) } {
                 Some(m) => m,
                 None => {
-                    println!("[menu] MISSING method: {}", $name);
+                    crate::elog!("[menu] MISSING method: {}", $name);
                     missing += 1;
                     Method::NULL
                 }
@@ -390,7 +390,7 @@ unsafe fn resolve_methods(rt: &dyn ScriptRuntime, domain: Domain) -> Option<M> {
             match unsafe { rt.method($cls, $name, $n) } {
                 Some(m) => m,
                 None => {
-                    println!("[menu] MISSING method (walk): {}", $name);
+                    crate::elog!("[menu] MISSING method (walk): {}", $name);
                     missing += 1;
                     Method::NULL
                 }
@@ -432,7 +432,7 @@ unsafe fn resolve_methods(rt: &dyn ScriptRuntime, domain: Domain) -> Option<M> {
     };
 
     if ty_canvas.is_null() || ty_image.is_null() || ty_text.is_null() || ty_rect_tf.is_null() {
-        println!("[menu] a required Type object is null -- AddComponent/GetComponent cannot work");
+        crate::elog!("[menu] a required Type object is null -- AddComponent/GetComponent cannot work");
         return None;
     }
     // Without these four the tree is meaningless; anything else just makes it
@@ -442,13 +442,13 @@ unsafe fn resolve_methods(rt: &dyn ScriptRuntime, domain: Domain) -> Option<M> {
         || resolved.go_get_comp.is_null()
         || resolved.tf_set_parent.is_null()
     {
-        println!("[menu] core GameObject/Transform methods missing -- aborting build");
+        crate::elog!("[menu] core GameObject/Transform methods missing -- aborting build");
         return None;
     }
     if missing > 0 {
-        println!("[menu] {} method(s) missing -- menu will build but look wrong", missing);
+        crate::elog!("[menu] {} method(s) missing -- menu will build but look wrong", missing);
     } else {
-        println!("[menu] all methods resolved");
+        crate::elog!("[menu] all methods resolved");
     }
     Some(resolved)
 }
@@ -644,7 +644,7 @@ unsafe fn build_ui(rt: &dyn ScriptRuntime, domain: Domain, m: &M) -> Option<Hand
         set_v2(rt, m.rt_off_max, con_txt_rt, -2.0, -2.0);
     }
 
-    println!("[menu] UI tree constructed");
+    crate::elog!("[menu] UI tree constructed");
     Some(Handles {
         root_go, window_rt, title_rt, close_rt, console_text, fps_text, status_text,
     })
@@ -687,7 +687,7 @@ pub unsafe fn on_frame() -> bool {
     // Separates "driver fires" from "UI builds".
     static FIRST_CALL: AtomicBool = AtomicBool::new(false);
     if !FIRST_CALL.swap(true, Ordering::Relaxed) {
-        println!("[menu] on_frame: driver is alive (first call)");
+        crate::elog!("[menu] on_frame: driver is alive (first call)");
     }
 
     // Before the throttle, or it measures the throttle.
@@ -717,14 +717,14 @@ pub unsafe fn on_frame() -> bool {
 
     // Lazy init, first call on the main thread.
     if !INITIALIZED.load(Ordering::Acquire) {
-        println!("[menu] initialising UGUI tree ({} backend)...", rt.backend().name());
+        crate::elog!("[menu] initialising UGUI tree ({} backend)...", rt.backend().name());
         let Some(m) = (unsafe { resolve_methods(rt, domain) }) else {
-            println!("[menu] resolve_methods failed -- menu disabled");
+            crate::elog!("[menu] resolve_methods failed -- menu disabled");
             INITIALIZED.store(true, Ordering::Release);
             return true;
         };
         let Some(h) = (unsafe { build_ui(rt, domain, &m) }) else {
-            println!("[menu] build_ui failed -- menu disabled");
+            crate::elog!("[menu] build_ui failed -- menu disabled");
             INITIALIZED.store(true, Ordering::Release);
             return true;
         };
@@ -738,7 +738,7 @@ pub unsafe fn on_frame() -> bool {
             })
         };
         INITIALIZED.store(true, Ordering::Release);
-        println!("[menu] ready");
+        crate::elog!("[menu] ready");
     }
 
     let Some(ms) = (unsafe { (*(&raw mut MENU_STATE)).as_mut() }) else { return true };
@@ -783,7 +783,7 @@ pub unsafe fn on_frame() -> bool {
         close_hit(sw, sh, cx, cy)
     };
     if x_clicked || UNLOAD_PENDING.load(Ordering::Relaxed) {
-        println!(
+        crate::elog!(
             "[menu] unload requested ({}) -- tearing down",
             if x_clicked { "X button" } else { "END key" }
         );
