@@ -115,6 +115,125 @@ pub mod unity {
     /// HorizontalWrapMode / VerticalWrapMode
     pub const WRAP_TRUNCATE: i32 = 0;
     pub const WRAP_OVERFLOW: i32 = 1;
+
+    // ── Rendering (chams) ─────────────────────────────────────────────────────
+    pub const COMPONENT: ClassRef = cls(asm::UNITY_CORE, ns::UNITY, "Component");
+    pub const RENDERER: ClassRef = cls(asm::UNITY_CORE, ns::UNITY, "Renderer");
+    /// The character mesh type. Filtering the transform walk to this excludes
+    /// transient effect renderers (particles, casings, decals) that otherwise
+    /// flood the walk every frame.
+    pub const SKINNED_MESH_RENDERER: ClassRef =
+        cls(asm::UNITY_CORE, ns::UNITY, "SkinnedMeshRenderer");
+    pub const MATERIAL: ClassRef = cls(asm::UNITY_CORE, ns::UNITY, "Material");
+    pub const SHADER: ClassRef = cls(asm::UNITY_CORE, ns::UNITY, "Shader");
+    pub const CAMERA: ClassRef = cls(asm::UNITY_CORE, ns::UNITY, "Camera");
+
+    /// Camera.main (static) and WorldToScreenPoint(Vector3) -> Vector3 (boxed),
+    /// the argc-1 overload. World-to-screen for the raid framework.
+    pub const CAMERA_GET_MAIN: &str = "get_main";
+    pub const CAMERA_WORLD_TO_SCREEN: &str = "WorldToScreenPoint";
+
+    // Object.FindObjectsOfType(Type) -> Object[]. 1-arg overload; some Unity
+    // versions add a (Type, bool) at arity 2, tried as a fallback.
+    pub const FIND_OBJECTS_OF_TYPE: &str = "FindObjectsOfType";
+    /// Object.Instantiate(Object) -> Object. The 1-arg overload; used to clone
+    /// a live material instead of Material..ctor(Shader), whose overload set
+    /// (Shader/Material/string) all collide at arity 1.
+    pub const INSTANTIATE: &str = "Instantiate";
+
+    // This build has no non-generic GetComponentsInChildren(Type, bool) -- only
+    // the generic <T> overloads, which cannot be resolved by an arity walk. So
+    // renderers are gathered by walking the transform tree with these, all
+    // non-generic: Component.get_transform, Transform.get_childCount,
+    // Transform.GetChild(int), and Component.GetComponent(Type).
+    pub const GET_COMPONENTS_IN_CHILDREN: &str = "GetComponentsInChildren";
+    pub const GET_TRANSFORM: &str = "get_transform";
+    pub const GET_CHILD_COUNT: &str = "get_childCount";
+    pub const GET_CHILD: &str = "GetChild";
+
+    // Renderer
+    pub const GET_MATERIALS: &str = "get_materials";
+    pub const SET_MATERIALS: &str = "set_materials";
+    pub const GET_SHARED_MATERIAL: &str = "get_sharedMaterial";
+    /// Renderer.sharedMaterials: the shared originals, no per-instance clone.
+    /// Captured on first touch so F5-off can restore exactly.
+    pub const GET_SHARED_MATERIALS: &str = "get_sharedMaterials";
+    pub const SET_SHARED_MATERIALS: &str = "set_sharedMaterials";
+    pub const GET_ENABLED: &str = "get_enabled";
+
+    /// UnityEngine.Object.name, for logging discovered shaders during tuning.
+    pub const GET_NAME: &str = "get_name";
+    /// Object.FindObjectsOfTypeAll(Type) -> Object[]: every loaded instance,
+    /// assets included. Used once to enumerate loaded Shaders for rim tuning.
+    pub const FIND_OBJECTS_OF_TYPE_ALL: &str = "FindObjectsOfTypeAll";
+
+    // Material
+    pub const MAT_SET_SHADER: &str = "set_shader";
+    pub const MAT_GET_SHADER: &str = "get_shader";
+    /// SetColor/SetInt/SetFloat: the (string, value) overloads. Verified on
+    /// 46911 to precede the (int nameID, value) overloads in metadata, so an
+    /// arity-2 exact lookup lands on the string form we pass a property name to.
+    pub const MAT_SET_COLOR: &str = "SetColor";
+    pub const MAT_SET_INT: &str = "SetInt";
+    pub const MAT_SET_FLOAT: &str = "SetFloat";
+    pub const MAT_ENABLE_KEYWORD: &str = "EnableKeyword";
+    pub const MAT_SET_RENDER_QUEUE: &str = "set_renderQueue";
+    /// Material.HasProperty(string). The (int) overload precedes it, so this
+    /// is resolved by walking to the arity-1 string form via a name check.
+    pub const MAT_HAS_PROPERTY: &str = "HasProperty";
+
+    // Shader
+    pub const SHADER_FIND: &str = "Find";
+
+    /// UnityEngine.Rendering.CompareFunction, for _ZTest. Always = draw through
+    /// everything; LessEqual / Greater split visible vs occluded for two-tone.
+    pub const ZTEST_ALWAYS: i32 = 8;
+    pub const ZTEST_LEQUAL: i32 = 4;
+    pub const ZTEST_GREATER: i32 = 5;
+
+    /// Shader-property names the cham material drives. Internal-Colored honours
+    /// _Color/_ZTest/_ZWrite/_Cull; the rim set is only honoured by a rim-
+    /// capable shader and is set best-effort (guarded by HasProperty).
+    pub const PROP_COLOR: &str = "_Color";
+    pub const PROP_ZTEST: &str = "_ZTest";
+    pub const PROP_ZWRITE: &str = "_ZWrite";
+    pub const PROP_CULL: &str = "_Cull";
+    /// Blend factors. Internal-Colored declares _SrcBlend/_DstBlend as Float
+    /// enums (UnityEngine.Rendering.BlendMode); driving them switches the
+    /// material between opaque / additive / alpha styles without a new shader.
+    pub const PROP_SRC_BLEND: &str = "_SrcBlend";
+    pub const PROP_DST_BLEND: &str = "_DstBlend";
+
+    /// UnityEngine.Rendering.BlendMode values we use.
+    pub const BLEND_ZERO: i32 = 0;
+    pub const BLEND_ONE: i32 = 1;
+    pub const BLEND_SRC_ALPHA: i32 = 5;
+    pub const BLEND_ONE_MINUS_SRC_ALPHA: i32 = 10;
+    /// UnityEngine.Rendering.CullMode.Off -- draw both faces (see through the
+    /// model to its back faces, which reads as depth on translucent styles).
+    pub const CULL_OFF: i32 = 0;
+    pub const CULL_BACK: i32 = 2;
+
+    /// UnityEngine.Cursor: forced visible + unlocked while the menu is open, so
+    /// the pointer can be seen and clicked (the game locks/hides it for
+    /// mouselook otherwise). Static setters. CursorLockMode.None = 0.
+    pub const CURSOR: ClassRef = cls(asm::UNITY_CORE, ns::UNITY, "Cursor");
+    pub const CURSOR_SET_VISIBLE: &str = "set_visible";
+    pub const CURSOR_SET_LOCK_STATE: &str = "set_lockState";
+    pub const CURSOR_LOCK_NONE: i32 = 0;
+
+    /// Rim/fresnel property names, in the spelling different shader families
+    /// use. Applied only where HasProperty confirms the shader has them.
+    pub const RIM_COLOR_PROPS: &[&str] = &["_RimColor", "_RimLightColor", "_FresnelColor", "_OutlineColor"];
+    pub const RIM_POWER_PROPS: &[&str] = &["_RimPower", "_RimLightPower", "_FresnelPower", "_RimIntensity"];
+
+    /// Rim-capable shaders to try before falling back to Internal-Colored.
+    /// Whichever the game happens to ship wins; discovery is logged.
+    pub const RIM_SHADER_CANDIDATES: &[&str] = &[
+        "Custom/Rim",
+        "Hidden/Rim",
+        "Unlit/Rim",
+    ];
 }
 
 // ── GAME tier: BSG's names. These are the ones that move. ─────────────────────
@@ -134,6 +253,25 @@ pub mod eft {
     /// in Assembly-CSharp are dead asset-store demo code, so it hooks cleanly
     /// and never fires.
     pub const DRIVER_METHODS: &[&str] = &["LateUpdate", "Update", "DoWorldTick"];
+
+    /// GameWorld collections of live players, tried in order. Real, readable
+    /// field names (not GClass), so binding them is safe, and chams falls back
+    /// to FindObjectsOfType(Player) if none resolve. Both are List<...Player>.
+    pub const PLAYER_LIST_FIELDS: &[&str] = &["RegisteredPlayers", "AllAlivePlayersList"];
+
+    /// Player._renderers: Renderer[], the game's own cached renderer array for a
+    /// player. Enumerating it is stable and cheap; chams prefers it over walking
+    /// the transform tree (which is expensive and hits a node cap).
+    pub const PLAYER_RENDERERS_FIELD: &str = "_renderers";
+
+    // ── Raid framework (world.rs) ─────────────────────────────────────────────
+    // Auto-property backing fields, read directly (no invoke). Verified live on
+    // 46911: IsYourPlayer @0xb89 (bool), AIData @0xa00 (ptr, non-null => bot).
+    pub const PLAYER_IS_LOCAL_FIELD: &str = "<IsYourPlayer>k__BackingField";
+    pub const PLAYER_AIDATA_FIELD: &str = "<AIData>k__BackingField";
+    /// Player.get_Position() -> Vector3 (boxed through runtime_invoke). No plain
+    /// position field exists; the getter computes it from the transform.
+    pub const PLAYER_GET_POSITION: &str = "get_Position";
 }
 
 // ── Field chains ──────────────────────────────────────────────────────────────

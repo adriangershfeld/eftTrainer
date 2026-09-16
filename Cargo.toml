@@ -7,11 +7,29 @@ edition = "2024"
 name = "eft_trainer"
 crate-type = ["cdylib"]
 
+# Size-optimised release. The hot paths are IL2CPP-invoke-bound, not
+# compute-bound, so optimising for size costs no measurable runtime speed while
+# cutting the DLL substantially. panic MUST stay "unwind": the driver hook and
+# worker rely on catch_unwind to stop a panic crossing the FFI boundary into
+# the game.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "unwind"
+
 [dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_SystemServices",
+    "Win32_System_Console",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+    "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
